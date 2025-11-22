@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/env python3
 """
-Mobile-friendly YT extractor for Termux
+Mobile-friendly YT extractor for Termux (and Render)
 
 - Auto-detects single video vs playlist (no mode dropdown)
 - UI:
@@ -11,8 +11,8 @@ Mobile-friendly YT extractor for Termux
     Single: show video title once + two buttons (Download, Preview)
     Playlist: each item shows its own title + two buttons (Download, Preview)
 - Only uses real downloadable progressive files (audio+video, http/https)
-- /download endpoint proxies the file with correct filename so browser downloads it
-- Uses ignoreerrors=True so unavailable playlist items are skipped instead of crashing
+- /download endpoint proxies the file with correct ASCII filename so browser downloads it
+- Playlist: skips deleted / private / sign-in-only videos instead of failing the whole list
 """
 
 from flask import (
@@ -26,8 +26,11 @@ from flask import (
 from yt_dlp import YoutubeDL
 import urllib.request
 import re
+import os
 
 app = Flask(__name__)
+
+# ------------------- FRONTEND (HTML + JS) -------------------
 
 HTML = r"""
 <!doctype html>
@@ -147,7 +150,6 @@ HTML = r"""
     border:0;
     font-size:15px;
   }
-  /* Download button PURPLE */
   .btn-download{
     background:var(--purple);
     color:#fdf4ff;
@@ -299,7 +301,7 @@ function renderSingle(data){
     box.appendChild(row);
     const note = document.createElement('div');
     note.className = 'note';
-    note.textContent = 'No direct downloadable file found.';
+    note.textContent = data.reason || 'No direct downloadable file found.';
     box.appendChild(note);
   }else{
     btnDl.addEventListener('click', ()=>{
@@ -342,7 +344,7 @@ function renderPlaylist(data){
   if(!entries.length){
     const note = document.createElement('div');
     note.className = 'note';
-    note.textContent = 'No items in playlist (all unavailable or deleted).';
+    note.textContent = data.reason || 'No items in playlist (all unavailable / deleted / locked).';
     results.appendChild(note);
     return;
   }
@@ -377,7 +379,7 @@ function renderPlaylist(data){
       box.appendChild(row);
       const note = document.createElement('div');
       note.className = 'note';
-      note.textContent = 'No direct downloadable file for this item.';
+      note.textContent = e.reason || 'No direct downloadable file for this item.';
       box.appendChild(note);
     }else{
       btnDl.addEventListener('click', ()=>{
@@ -418,7 +420,7 @@ setStatus('idle','Idle');
 </html>
 """
 
-# ------------ Backend helpers ------------
+# ------------------- BACKEND HELPERS -------------------
 
 def human_size(n):
     if not n:
@@ -494,7 +496,7 @@ def sanitize_title(title: str) -> str:
         title = title[:100]
     return title
 
-# ------------ Routes ------------
+# ------------------- ROUTES -------------------
 
 @app.route("/")
 def index():
@@ -510,8 +512,9 @@ def extract():
     if not (url.startswith("http://") or url.startswith("https://")):
         return jsonify({"error": "URL must start with http:// or https://"}), 400
 
-    # ignoreerrors=True => skip unavailable videos in playlist instead of raising
-    ydl_opts = {
+    # First call: check if it's playlist or single.
+    # Use extract_flat for playlists so one bad item doesn't kill the whole list.
+    base_opts = {
         "skip_download": True,
         "quiet": True,
         "no_warnings": True,
@@ -519,50 +522,92 @@ def extract():
     }
 
     try:
-        with YoutubeDL(ydl_opts) as ydl:
+        with YoutubeDL(base_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
-        # single or playlist completely failing (deleted/private)
-        return jsonify({"error": "Cannot extract info (maybe deleted/private)", "details": str(e)}), 400
+        # Whole URL needs sign-in / is private
+        return jsonify({
+            "error": "Cannot extract info (maybe deleted/private or sign-in required).",
+            "details": str(e),
+        }), 400
 
     if not info:
-        return jsonify({"error": "No info returned (maybe all items unavailable)"}), 400
+        return jsonify({
+            "error": "No info returned (maybe unavailable or blocked)."
+        }), 400
 
-    # Auto-detect playlist vs single
+    # PLAYLIST HANDLING (per-video extraction to skip bad ones)
     if "entries" in info and info["entries"]:
-        # entries may contain None for errors (because ignoreerrors=True) -> filter
-        entries_info = [e for e in info["entries"] if e]
-        if len(entries_info) > 1:
-            # Playlist mode
+        # entries may contain None when ignoreerrors=True
+        raw_entries = [e for e in info["entries"] if e]
+
+        # If it is truly a list with more than one video, treat as playlist.
+        if len(raw_entries) > 1:
             out_entries = []
-            for e in entries_info:
-                fmts = e.get("formats") or []
+            for e in raw_entries:
+                # each "e" may be flat or full; we re-extract per video so we can skip locked ones
+                video_url = e.get("url") or e.get("webpage_url") or e.get("id")
+                if not video_url:
+                    continue
+
+                # Make sure we have a full URL
+                if not video_url.startswith("http"):
+                    video_url = f"https://www.youtube.com/watch?v={video_url}"
+
+                try:
+                    with YoutubeDL(base_opts) as vdl:
+                        vinfo = vdl.extract_info(video_url, download=False)
+                except Exception as ve:
+                    # skip videos that need sign-in or error out
+                    out_entries.append({
+                        "id": e.get("id"),
+                        "title": e.get("title"),
+                        "file": None,
+                        "reason": "Skipped (needs sign-in / unavailable)."
+                    })
+                    continue
+
+                fmts = vinfo.get("formats") or []
                 best = choose_best_file(fmts)
                 out_entries.append({
-                    "id": e.get("id"),
-                    "title": e.get("title"),
+                    "id": vinfo.get("id") or e.get("id"),
+                    "title": vinfo.get("title") or e.get("title"),
                     "file": fmt_to_file(best),
                 })
+
             return jsonify({
                 "mode": "playlist",
                 "title": info.get("title") or "Playlist",
                 "entries": out_entries,
+                "reason": None if out_entries else "All items unavailable / locked.",
             })
-        elif len(entries_info) == 1:
-            entry = entries_info[0]
+
+        # If one entry, treat as single video
+        elif len(raw_entries) == 1:
+            entry = raw_entries[0]
         else:
-            # all items failed / unavailable
             return jsonify({
                 "mode": "playlist",
                 "title": info.get("title") or "Playlist",
                 "entries": [],
+                "reason": "No playable items found in this playlist.",
             })
     else:
+        # Not a playlist -> single video
         entry = info
 
-    # Single video
+    # SINGLE VIDEO HANDLING
+    # If this video itself needs sign-in or is completely blocked, there may be no formats
     fmts = entry.get("formats") or []
     best = choose_best_file(fmts)
+
+    if not best:
+        return jsonify({
+            "mode": "single",
+            "title": entry.get("title"),
+            "file": None,
+            "reason": "No direct downloadable file (maybe sign-in or streaming-only).",
+        })
 
     return jsonify({
         "mode": "single",
@@ -602,5 +647,7 @@ def download_proxy():
     return Response(stream_with_context(generate()), headers=headers)
 
 if __name__ == "__main__":
-    print("Starting Video Downloader at http://127.0.0.1:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    # Works both on Termux and Render (Render sets PORT env var)
+    port = int(os.environ.get("PORT", 5000))
+    print(f"Starting Video Downloader on 0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)

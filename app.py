@@ -1,18 +1,20 @@
 #!/data/data/com.termux/files/usr/bin/env python3
 """
-Mobile-friendly YT extractor for Termux (and Render)
+Mobile-friendly YT extractor for Termux (and cloud)
 
-- Auto-detects single video vs playlist (no mode dropdown)
-- UI:
-    Top: "Video Downloader" (app title)
-    Under it: status (Idle / Fetching… / Success / Failed)
-    Then: URL box + Fetch button
-- Results:
-    Single: show video title once + two buttons (Download, Preview)
-    Playlist: each item shows its own title + two buttons (Download, Preview)
+Features:
+- Auto-detect single vs playlist (no mode dropdown)
+- Clean mobile UI:
+    - Title "Video Downloader"
+    - URL box + Fetch button
+    - Status: Idle / Fetching… / Success / Failed
+    - Results:
+        Single: title once + Download (purple) + Preview
+        Playlist: each item has title + Download + Preview
 - Only uses real downloadable progressive files (audio+video, http/https)
-- /download endpoint proxies the file with correct ASCII filename so browser downloads it
-- Playlist: skips deleted / private / sign-in-only videos instead of failing the whole list
+- /download endpoint proxies file so browser downloads with correct filename
+- /upload_cookies endpoint lets user upload cookies.txt from the browser
+- yt-dlp automatically uses cookies.txt IF it exists (for cloud / sign-in)
 """
 
 from flask import (
@@ -114,6 +116,39 @@ HTML = r"""
     text-align:center;
   }
 
+  /* Cookies area */
+  .cookies-box{
+    margin-top:12px;
+    padding:10px;
+    border-radius:12px;
+    background:rgba(15,23,42,0.9);
+    border:1px dashed rgba(148,163,184,0.5);
+    font-size:12px;
+  }
+  .cookies-row{
+    display:flex;
+    gap:8px;
+    margin-top:6px;
+    flex-wrap:wrap;
+  }
+  #cookiesFile{
+    flex:1;
+    font-size:12px;
+  }
+  #uploadCookiesBtn{
+    padding:7px 10px;
+    border-radius:8px;
+    border:0;
+    background:rgba(124,58,237,0.9);
+    color:#fdf4ff;
+    font-size:13px;
+  }
+  #cookiesStatus{
+    margin-top:4px;
+    font-size:11px;
+    color:var(--muted);
+  }
+
   /* Results */
   #title{
     font-size:16px;
@@ -191,6 +226,15 @@ HTML = r"""
     <button id="fetchBtn">Fetch</button>
 
     <div id="error"></div>
+
+    <div class="cookies-box">
+      <div><b>Optional:</b> Upload <code>cookies.txt</code> for cloud / sign-in videos.</div>
+      <div class="cookies-row">
+        <input type="file" id="cookiesFile" accept=".txt" />
+        <button id="uploadCookiesBtn">Upload cookies</button>
+      </div>
+      <div id="cookiesStatus">No cookies uploaded yet.</div>
+    </div>
   </div>
 
   <!-- Results -->
@@ -274,7 +318,7 @@ function buildDownloadUrl(file, title){
 function renderSingle(data){
   const results = $('results');
   results.innerHTML = '';
-  const title = data.title || 'Untitled';
+  const title = data.title || 'Video';
   $('title').textContent = title;
 
   const file = data.file;
@@ -411,8 +455,39 @@ function renderPlaylist(data){
   });
 }
 
+async function uploadCookies(){
+  const input = $('cookiesFile');
+  const status = $('cookiesStatus');
+  if(!input.files || !input.files[0]){
+    status.textContent = 'Choose a cookies.txt file first.';
+    return;
+  }
+  const file = input.files[0];
+  status.textContent = 'Uploading cookies…';
+
+  const fd = new FormData();
+  fd.append('file', file);
+
+  try{
+    const resp = await fetch('/upload_cookies', {
+      method: 'POST',
+      body: fd
+    });
+    const data = await resp.json().catch(()=>null);
+    if(!resp.ok){
+      status.textContent = (data && data.error) ? data.error : 'Upload failed.';
+      return;
+    }
+    status.textContent = data && data.message ? data.message : 'Cookies uploaded.';
+  }catch(e){
+    console.error(e);
+    status.textContent = 'Upload error: ' + (e.message || String(e));
+  }
+}
+
 $('fetchBtn').addEventListener('click', fetchData);
 $('url').addEventListener('keydown', e=>{ if(e.key === 'Enter') fetchData(); });
+$('uploadCookiesBtn').addEventListener('click', uploadCookies);
 
 setStatus('idle','Idle');
 </script>
@@ -512,58 +587,66 @@ def extract():
     if not (url.startswith("http://") or url.startswith("https://")):
         return jsonify({"error": "URL must start with http:// or https://"}), 400
 
-    # First call: check if it's playlist or single.
-    # Use extract_flat for playlists so one bad item doesn't kill the whole list.
+    # yt-dlp options (add cookiefile if cookies.txt present)
     base_opts = {
         "skip_download": True,
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
     }
+    if os.path.exists("cookies.txt"):
+        base_opts["cookiefile"] = "cookies.txt"
 
+    # Try to extract info; ANY error will return 200 with a friendly reason
     try:
         with YoutubeDL(base_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
-        # Whole URL needs sign-in / is private
+        msg = str(e)
+        reason = "Cannot extract info."
+        if "Sign in to confirm you’re not a bot" in msg or "Sign in to confirm you're not a bot" in msg:
+            reason = ("YouTube is asking you to sign in (bot check). "
+                      "Upload cookies.txt from your browser and try again.")
+        elif "Video unavailable" in msg:
+            reason = "Video unavailable (deleted, private or blocked)."
+
         return jsonify({
-            "error": "Cannot extract info (maybe deleted/private or sign-in required).",
-            "details": str(e),
-        }), 400
+            "mode": "single",
+            "title": "Unavailable video",
+            "file": None,
+            "reason": reason,
+        }), 200
 
     if not info:
         return jsonify({
-            "error": "No info returned (maybe unavailable or blocked)."
-        }), 400
+            "mode": "single",
+            "title": "Unavailable video",
+            "file": None,
+            "reason": "No info returned (maybe unavailable or blocked).",
+        }), 200
 
-    # PLAYLIST HANDLING (per-video extraction to skip bad ones)
+    # PLAYLIST HANDLING
     if "entries" in info and info["entries"]:
-        # entries may contain None when ignoreerrors=True
         raw_entries = [e for e in info["entries"] if e]
 
-        # If it is truly a list with more than one video, treat as playlist.
         if len(raw_entries) > 1:
             out_entries = []
             for e in raw_entries:
-                # each "e" may be flat or full; we re-extract per video so we can skip locked ones
                 video_url = e.get("url") or e.get("webpage_url") or e.get("id")
                 if not video_url:
                     continue
-
-                # Make sure we have a full URL
                 if not video_url.startswith("http"):
                     video_url = f"https://www.youtube.com/watch?v={video_url}"
 
                 try:
                     with YoutubeDL(base_opts) as vdl:
                         vinfo = vdl.extract_info(video_url, download=False)
-                except Exception as ve:
-                    # skip videos that need sign-in or error out
+                except Exception:
                     out_entries.append({
                         "id": e.get("id"),
                         "title": e.get("title"),
                         "file": None,
-                        "reason": "Skipped (needs sign-in / unavailable)."
+                        "reason": "Skipped (sign-in required / unavailable).",
                     })
                     continue
 
@@ -580,9 +663,8 @@ def extract():
                 "title": info.get("title") or "Playlist",
                 "entries": out_entries,
                 "reason": None if out_entries else "All items unavailable / locked.",
-            })
+            }), 200
 
-        # If one entry, treat as single video
         elif len(raw_entries) == 1:
             entry = raw_entries[0]
         else:
@@ -591,13 +673,11 @@ def extract():
                 "title": info.get("title") or "Playlist",
                 "entries": [],
                 "reason": "No playable items found in this playlist.",
-            })
+            }), 200
     else:
-        # Not a playlist -> single video
-        entry = info
+        entry = info  # Not a playlist
 
-    # SINGLE VIDEO HANDLING
-    # If this video itself needs sign-in or is completely blocked, there may be no formats
+    # SINGLE VIDEO
     fmts = entry.get("formats") or []
     best = choose_best_file(fmts)
 
@@ -607,13 +687,13 @@ def extract():
             "title": entry.get("title"),
             "file": None,
             "reason": "No direct downloadable file (maybe sign-in or streaming-only).",
-        })
+        }), 200
 
     return jsonify({
         "mode": "single",
         "title": entry.get("title"),
         "file": fmt_to_file(best),
-    })
+    }), 200
 
 @app.route("/download")
 def download_proxy():
@@ -646,8 +726,27 @@ def download_proxy():
     }
     return Response(stream_with_context(generate()), headers=headers)
 
+@app.route("/upload_cookies", methods=["POST"])
+def upload_cookies():
+    """
+    Accepts a cookies.txt file uploaded from the frontend and saves it
+    as cookies.txt in the current working directory.
+    """
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    f = request.files['file']
+    if not f or f.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    save_path = os.path.join(os.getcwd(), "cookies.txt")
+    try:
+        f.save(save_path)
+    except Exception as e:
+        return jsonify({"error": "Failed to save cookies.txt", "details": str(e)}), 500
+
+    return jsonify({"message": "cookies.txt uploaded successfully. yt-dlp will use it for the next fetch."}), 200
+
 if __name__ == "__main__":
-    # Works both on Termux and Render (Render sets PORT env var)
     port = int(os.environ.get("PORT", 5000))
     print(f"Starting Video Downloader on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
